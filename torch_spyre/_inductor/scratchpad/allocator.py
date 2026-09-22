@@ -1624,13 +1624,42 @@ def _fused_layout_group_ops(
             if isinstance(dep, MemoryDep):
                 group.setdefault(dep.name, reason_of_seed[seed.name])
     # Consumers of any seed output (output clones / dequant / bias-add).
+    consumers_by_input: dict[str, list[ComputedBuffer]] = defaultdict(list)
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        for dep in op_read_writes(op).reads:
-            if isinstance(dep, MemoryDep) and dep.name in reason_of_seed:
-                group.setdefault(op.name, reason_of_seed[dep.name])
-                break
+        for parent in {
+            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
+        }:
+            consumers_by_input[parent].append(op)
+            if parent in reason_of_seed:
+                group.setdefault(op.name, reason_of_seed[parent])
+
+    # keep_by_index layouts remain fragile through layout-transparent pointwise
+    # bridges. Protect the first layout-sensitive consumer after such a chain as
+    # well; otherwise the joint solver can independently re-divide that consumer
+    # and silently reinterpret the producer's logical coordinates.
+    for seed in seeds:
+        if seed.data.reduction_type != KEEP_BY_INDEX_OP:
+            continue
+        reason = reason_of_seed[seed.name]
+        queue = [seed.name]
+        visited = {seed.name}
+        while queue:
+            parent = queue.pop(0)
+            for consumer in consumers_by_input.get(parent, []):
+                group.setdefault(consumer.name, reason)
+                input_names = {
+                    dep.name
+                    for dep in op_read_writes(consumer).reads
+                    if isinstance(dep, MemoryDep)
+                }
+                transparent = isinstance(consumer.data, Pointwise) and input_names == {
+                    parent
+                }
+                if transparent and consumer.name not in visited:
+                    visited.add(consumer.name)
+                    queue.append(consumer.name)
     return group
 
 
