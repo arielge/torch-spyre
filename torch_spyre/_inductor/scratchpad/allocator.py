@@ -1582,12 +1582,13 @@ def _fused_layout_group_ops(
     when its group is pinned; every op in that seed's group inherits it.
 
     A group is one seed reduction plus the input producers it reads (one hop
-    back) and the consumers of its output (one hop forward): the tightly coupled
-    neighbours the work-division pass slices into a single mutually compatible
-    per-core division. The joint solver, free to divide each op independently,
-    can hand the group's members incompatible divisions and corrupt the shared
+    back) and consumers coupled to its output. FP8 groups include immediate
+    consumers. Keep-by-index groups additionally follow single-parent pointwise
+    operations and include the first consumer after each such chain. The joint
+    solver, free to divide each op independently, can hand the group's members
+    incompatible divisions and corrupt the shared
     per-core addressing/scheduling, so the caller pins the whole group to its
-    fixed (work-division) division. Two op kinds need this identical treatment:
+    fixed (work-division) division. Two op kinds need this treatment:
 
     * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
       input restickifies and output clones carry too; an output clone splitting
@@ -1624,42 +1625,37 @@ def _fused_layout_group_ops(
             if isinstance(dep, MemoryDep):
                 group.setdefault(dep.name, reason_of_seed[seed.name])
     # Consumers of any seed output (output clones / dequant / bias-add).
-    consumers_by_input: dict[str, list[ComputedBuffer]] = defaultdict(list)
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        for parent in {
-            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
-        }:
-            consumers_by_input[parent].append(op)
-            if parent in reason_of_seed:
-                group.setdefault(op.name, reason_of_seed[parent])
+        for dep in op_read_writes(op).reads:
+            if isinstance(dep, MemoryDep) and dep.name in reason_of_seed:
+                group.setdefault(op.name, reason_of_seed[dep.name])
+                break
 
-    # keep_by_index layouts remain fragile through layout-transparent pointwise
-    # bridges. Protect the first layout-sensitive consumer after such a chain as
-    # well; otherwise the joint solver can independently re-divide that consumer
-    # and silently reinterpret the producer's logical coordinates.
-    for seed in seeds:
-        if seed.data.reduction_type != KEEP_BY_INDEX_OP:
+    # Follow keep_by_index through single-parent pointwise bridges and include
+    # the first consumer after each chain. Graph operations are topologically
+    # ordered, so one forward pass is sufficient.
+    reachable = {
+        seed.name: reason_of_seed[seed.name]
+        for seed in seeds
+        if seed.data.reduction_type == KEEP_BY_INDEX_OP
+    }
+    if not reachable:
+        return group
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
             continue
-        reason = reason_of_seed[seed.name]
-        queue = [seed.name]
-        visited = {seed.name}
-        while queue:
-            parent = queue.pop(0)
-            for consumer in consumers_by_input.get(parent, []):
-                group.setdefault(consumer.name, reason)
-                input_names = {
-                    dep.name
-                    for dep in op_read_writes(consumer).reads
-                    if isinstance(dep, MemoryDep)
-                }
-                transparent = isinstance(consumer.data, Pointwise) and input_names == {
-                    parent
-                }
-                if transparent and consumer.name not in visited:
-                    visited.add(consumer.name)
-                    queue.append(consumer.name)
+        input_names = [
+            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
+        ]
+        parent = next((name for name in input_names if name in reachable), None)
+        if parent is None:
+            continue
+        reason = reachable[parent]
+        group.setdefault(op.name, reason)
+        if isinstance(op.data, Pointwise) and set(input_names) == {parent}:
+            reachable[op.name] = reason
     return group
 
 
